@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+ 
+import pandas as pd
+import numpy as np
+ 
+# ===== CONFIG =====
+OUTPUT_CSV = "/home/miteshv/Documents/data_converter/Arai/your_file_with_pose.csv"
+CALIBRATION_GAIN = 0.5   # 0.3–0.7 recommended
+ 
+# ===== LOAD FILE =====
+df = pd.read_csv(OUTPUT_CSV)
+ 
+required_cols = [
+    "x_m", "y_m",
+    "vx_mps", "vy_mps",
+    "dist_from_start_m",
+    "true_displacement"
+]
+ 
+for col in required_cols:
+    if col not in df.columns:
+        raise ValueError(f"Missing column: {col}")
+ 
+# Convert to numpy
+x = df["x_m"].to_numpy(dtype=float)
+y = df["y_m"].to_numpy(dtype=float)
+vx = df["vx_mps"].to_numpy(dtype=float)
+vy = df["vy_mps"].to_numpy(dtype=float)
+true_disp = pd.to_numeric(df["true_displacement"], errors="coerce").to_numpy()
+ 
+# ===== CALIBRATION LOOP =====
+for i in range(len(x)):
+    d_true = true_disp[i]
+    d_imu = np.hypot(x[i], y[i])
+ 
+    if not np.isnan(d_true) and d_imu > 1e-6:
+        error = d_true - d_imu
+        scale = 1 + CALIBRATION_GAIN * (error / d_imu)
+ 
+        # Correct position
+        x[i] *= scale
+        y[i] *= scale
+ 
+        # Correct velocity
+        vx[i] *= scale
+        vy[i] *= scale
+ 
+# ===== RECOMPUTE METRICS =====
+speed = np.hypot(vx, vy)
+dist_from_start = np.hypot(x, y)
+ 
+path_length = np.zeros_like(speed)
+for i in range(1, len(path_length)):
+    dx = x[i] - x[i-1]
+    dy = y[i] - y[i-1]
+    step = np.hypot(dx, dy)
+    path_length[i] = path_length[i-1] + step
+ 
+total_distance = float(path_length[-1])
+final_displacement = float(dist_from_start[-1])
+final_speed = float(speed[-1])
+ 
+# ===== WRITE BACK TO SAME CSV =====
+df["x_m"] = x
+df["y_m"] = y
+df["vx_mps"] = vx
+df["vy_mps"] = vy
+df["speed_mps"] = speed
+df["dist_from_start_m"] = dist_from_start
+df["path_length_m"] = path_length
+ 
+df.to_csv(OUTPUT_CSV, index=False)
+ 
+# ===== SUMMARY =====
+print(f"Calibration complete: {OUTPUT_CSV}")
+print(f"Final displacement: {final_displacement:.2f} m")
+print(f"Total path distance: {total_distance:.2f} m")
+print(f"Final speed: {final_speed:.2f} m/s")
