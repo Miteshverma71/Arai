@@ -1,0 +1,335 @@
+"""
+Replace one nuScenes scene with custom scene data.
+
+This script is intentionally hardcoded so you can edit the paths here and run it
+directly from your IDE without argparse or terminal flags.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+# Edit these values if your folders move.
+NUSCENES_ROOT = Path(r"C:\Users\mitvi\Downloads\conversion_infer\nuscenes")
+NUSCENES_VERSION = "v1.0-mini"
+SOURCE_SCENE_ROOT = Path(r"C:\Users\mitvi\Downloads\conversion_infer\scene0021")
+TARGET_SCENE_NAME = "scene-0103"
+
+# Your source channel names mapped to standard nuScenes channel names.
+SOURCE_TO_NUSCENES_CHANNEL = {
+    "CAM_FR": "CAM_FRONT",
+    "CAM_RC": "CAM_BACK",
+    "CAM_SL1": "CAM_FRONT_LEFT",
+    "CAM_SL2": "CAM_BACK_LEFT",
+    "CAM_SR1": "CAM_FRONT_RIGHT",
+    "CAM_SR2": "CAM_BACK_RIGHT",
+    "LIDAR_DATA": "LIDAR_TOP",
+}
+
+JSON_FILES_TO_BACKUP = [
+    "sample.json",
+    "sample_data.json",
+    "ego_pose.json",
+    "calibrated_sensor.json",
+]
+
+
+def load_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def save_json(path: Path, data: Any) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+
+
+def stable_token(*parts: str) -> str:
+    joined = "::".join(parts)
+    return hashlib.md5(joined.encode("utf-8")).hexdigest()
+
+
+def normalize_link(value: str | None) -> str:
+    return value or ""
+
+
+def ordered_scene_samples(scene_row: dict[str, Any], all_samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_token = {sample["token"]: sample for sample in all_samples}
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    current = scene_row["first_sample_token"]
+
+    while current:
+        if current in seen:
+            raise RuntimeError(f"Loop detected while following sample chain for {scene_row['name']}")
+        if current not in by_token:
+            raise RuntimeError(f"Missing sample token {current} for scene {scene_row['name']}")
+
+        ordered.append(by_token[current])
+        seen.add(current)
+        current = normalize_link(by_token[current].get("next"))
+
+    expected = scene_row["nbr_samples"]
+    if len(ordered) != expected:
+        raise RuntimeError(
+            f"Scene {scene_row['name']} expected {expected} samples but chain yielded {len(ordered)}"
+        )
+
+    return ordered
+
+
+def make_backup(metadata_root: Path) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_dir = metadata_root / "_scene_replace_backups" / f"{TARGET_SCENE_NAME}_{stamp}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    for file_name in JSON_FILES_TO_BACKUP:
+        shutil.copy2(metadata_root / file_name, backup_dir / file_name)
+
+    return backup_dir
+
+
+def build_sensor_channel_map(sensor_rows: list[dict[str, Any]]) -> dict[str, str]:
+    return {row["token"]: row["channel"] for row in sensor_rows}
+
+
+def build_channel_sensor_token_map(sensor_rows: list[dict[str, Any]]) -> dict[str, str]:
+    return {row["channel"]: row["token"] for row in sensor_rows}
+
+
+def remap_relative_filename(source_filename: str) -> tuple[str, str]:
+    normalized = source_filename.replace("\\", "/")
+    parts = normalized.split("/")
+    if len(parts) < 3:
+        raise RuntimeError(f"Unexpected source filename format: {source_filename}")
+
+    split_name = parts[0]
+    source_channel = parts[1]
+    mapped_channel = SOURCE_TO_NUSCENES_CHANNEL[source_channel]
+    file_name = parts[-1]
+    prefixed_name = f"{TARGET_SCENE_NAME.replace('-', '_')}__{file_name}"
+
+    return source_channel, "/".join([split_name, mapped_channel, prefixed_name])
+
+
+def copy_scene_files(source_rows: list[dict[str, Any]]) -> None:
+    copied = 0
+    for row in source_rows:
+        _, relative_target = remap_relative_filename(row["filename"])
+        source_path = SOURCE_SCENE_ROOT / Path(*row["filename"].replace("\\", "/").split("/"))
+        target_path = NUSCENES_ROOT / Path(*relative_target.split("/"))
+
+        if not source_path.exists():
+            raise FileNotFoundError(f"Missing source file: {source_path}")
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target_path)
+        copied += 1
+
+    print(f"Copied {copied} files into {NUSCENES_ROOT}")
+
+
+def anchored_timestamp(source_timestamp: int, source_start: int, target_start: int) -> int:
+    return target_start + (source_timestamp - source_start)
+
+
+def main() -> None:
+    metadata_root = NUSCENES_ROOT / NUSCENES_VERSION
+    if not metadata_root.exists():
+        raise FileNotFoundError(f"nuScenes metadata folder does not exist: {metadata_root}")
+
+    source_metadata_root = SOURCE_SCENE_ROOT / "v1.0-native"
+    if not source_metadata_root.exists():
+        raise FileNotFoundError(f"Source metadata folder does not exist: {source_metadata_root}")
+
+    target_scene_rows = load_json(metadata_root / "scene.json")
+    target_sample_rows = load_json(metadata_root / "sample.json")
+    target_sample_data_rows = load_json(metadata_root / "sample_data.json")
+    target_ego_pose_rows = load_json(metadata_root / "ego_pose.json")
+    target_calibrated_sensor_rows = load_json(metadata_root / "calibrated_sensor.json")
+    target_sensor_rows = load_json(metadata_root / "sensor.json")
+
+    source_scene_rows = load_json(source_metadata_root / "scene.json")
+    source_sample_rows = load_json(source_metadata_root / "sample.json")
+    source_sample_data_rows = load_json(source_metadata_root / "sample_data.json")
+    source_ego_pose_rows = load_json(source_metadata_root / "ego_pose.json")
+    source_calibrated_sensor_rows = load_json(source_metadata_root / "calibrated_sensor.json")
+    source_sensor_rows = load_json(source_metadata_root / "sensor.json")
+
+    target_scene = next((row for row in target_scene_rows if row["name"] == TARGET_SCENE_NAME), None)
+    if target_scene is None:
+        raise RuntimeError(f"Could not find target scene {TARGET_SCENE_NAME}")
+
+    if len(source_scene_rows) != 1:
+        raise RuntimeError("Expected exactly one scene in the source metadata bundle")
+    source_scene = source_scene_rows[0]
+
+    target_ordered_samples = ordered_scene_samples(target_scene, target_sample_rows)
+    source_ordered_samples = ordered_scene_samples(source_scene, source_sample_rows)
+
+    if len(target_ordered_samples) != len(source_ordered_samples):
+        raise RuntimeError(
+            f"Sample count mismatch: target has {len(target_ordered_samples)}, "
+            f"source has {len(source_ordered_samples)}"
+        )
+
+    target_sample_tokens = [row["token"] for row in target_ordered_samples]
+    target_sample_token_set = set(target_sample_tokens)
+    source_sample_tokens = [row["token"] for row in source_ordered_samples]
+    source_sample_token_set = set(source_sample_tokens)
+    source_to_target_sample_token = {
+        source_row["token"]: target_row["token"]
+        for source_row, target_row in zip(source_ordered_samples, target_ordered_samples)
+    }
+
+    source_start_timestamp = source_ordered_samples[0]["timestamp"]
+    target_start_timestamp = target_ordered_samples[0]["timestamp"]
+
+    source_sensor_channels = build_sensor_channel_map(source_sensor_rows)
+    target_sensor_tokens = build_channel_sensor_token_map(target_sensor_rows)
+    source_calibrated_by_channel = {
+        source_sensor_channels[row["sensor_token"]]: row for row in source_calibrated_sensor_rows
+    }
+
+    missing_channels = [channel for channel in SOURCE_TO_NUSCENES_CHANNEL if channel not in source_calibrated_by_channel]
+    if missing_channels:
+        raise RuntimeError(f"Source metadata is missing calibrated sensors for: {missing_channels}")
+
+    new_scene_calibrated_rows: list[dict[str, Any]] = []
+    new_scene_calibrated_tokens: dict[str, str] = {}
+    for source_channel, nuscenes_channel in SOURCE_TO_NUSCENES_CHANNEL.items():
+        if nuscenes_channel not in target_sensor_tokens:
+            raise RuntimeError(f"Target sensor table is missing channel {nuscenes_channel}")
+
+        source_calibrated = source_calibrated_by_channel[source_channel]
+        token = stable_token("calibrated_sensor", TARGET_SCENE_NAME, nuscenes_channel)
+        new_scene_calibrated_tokens[nuscenes_channel] = token
+        new_scene_calibrated_rows.append(
+            {
+                "token": token,
+                "sensor_token": target_sensor_tokens[nuscenes_channel],
+                "translation": source_calibrated["translation"],
+                "rotation": source_calibrated["rotation"],
+                "camera_intrinsic": source_calibrated.get("camera_intrinsic", []),
+            }
+        )
+
+    source_scene_sample_data_rows = [
+        row for row in source_sample_data_rows if row["sample_token"] in source_sample_token_set
+    ]
+    if not source_scene_sample_data_rows:
+        raise RuntimeError("No source sample_data rows matched the source scene")
+
+    copy_scene_files(source_scene_sample_data_rows)
+
+    source_sample_data_token_map = {
+        row["token"]: stable_token("sample_data", TARGET_SCENE_NAME, row["token"])
+        for row in source_scene_sample_data_rows
+    }
+
+    source_scene_ego_pose_tokens = {row["ego_pose_token"] for row in source_scene_sample_data_rows}
+    source_ego_pose_token_map: dict[str, str] = {}
+    new_scene_ego_pose_rows: list[dict[str, Any]] = []
+    for row in source_ego_pose_rows:
+        if row["token"] not in source_scene_ego_pose_tokens:
+            continue
+
+        new_token = stable_token("ego_pose", TARGET_SCENE_NAME, row["token"])
+        source_ego_pose_token_map[row["token"]] = new_token
+        new_scene_ego_pose_rows.append(
+            {
+                **row,
+                "token": new_token,
+                "timestamp": anchored_timestamp(row["timestamp"], source_start_timestamp, target_start_timestamp),
+            }
+        )
+
+    if len(source_ego_pose_token_map) == 0:
+        raise RuntimeError("No ego_pose rows were matched from the source scene")
+
+    new_scene_sample_data_rows: list[dict[str, Any]] = []
+    for row in source_scene_sample_data_rows:
+        source_channel, new_relative_filename = remap_relative_filename(row["filename"])
+        nuscenes_channel = SOURCE_TO_NUSCENES_CHANNEL[source_channel]
+
+        if row["ego_pose_token"] not in source_ego_pose_token_map:
+            raise RuntimeError(f"Missing mapped ego pose for source token {row['ego_pose_token']}")
+
+        new_scene_sample_data_rows.append(
+            {
+                **row,
+                "token": source_sample_data_token_map[row["token"]],
+                "sample_token": source_to_target_sample_token[row["sample_token"]],
+                "ego_pose_token": source_ego_pose_token_map[row["ego_pose_token"]],
+                "calibrated_sensor_token": new_scene_calibrated_tokens[nuscenes_channel],
+                "timestamp": anchored_timestamp(row["timestamp"], source_start_timestamp, target_start_timestamp),
+                "filename": new_relative_filename,
+                "prev": source_sample_data_token_map.get(normalize_link(row.get("prev")), ""),
+                "next": source_sample_data_token_map.get(normalize_link(row.get("next")), ""),
+            }
+        )
+
+    updated_target_samples: list[dict[str, Any]] = []
+    source_samples_by_target_token = {
+        target_row["token"]: source_row for source_row, target_row in zip(source_ordered_samples, target_ordered_samples)
+    }
+    for row in target_sample_rows:
+        if row["token"] not in target_sample_token_set:
+            updated_target_samples.append(row)
+            continue
+
+        source_row = source_samples_by_target_token[row["token"]]
+        updated_target_samples.append(
+            {
+                **row,
+                "timestamp": anchored_timestamp(
+                    source_row["timestamp"], source_start_timestamp, target_start_timestamp
+                ),
+            }
+        )
+
+    removed_target_scene_sample_data = [
+        row for row in target_sample_data_rows if row["sample_token"] in target_sample_token_set
+    ]
+    removed_target_scene_ego_pose_tokens = {row["ego_pose_token"] for row in removed_target_scene_sample_data}
+
+    kept_target_sample_data_rows = [
+        row for row in target_sample_data_rows if row["sample_token"] not in target_sample_token_set
+    ]
+    kept_target_ego_pose_rows = [
+        row for row in target_ego_pose_rows if row["token"] not in removed_target_scene_ego_pose_tokens
+    ]
+    kept_target_calibrated_sensor_rows = [
+        row
+        for row in target_calibrated_sensor_rows
+        if row["token"] not in set(new_scene_calibrated_tokens.values())
+    ]
+
+    backup_dir = make_backup(metadata_root)
+
+    save_json(metadata_root / "sample.json", updated_target_samples)
+    save_json(metadata_root / "sample_data.json", kept_target_sample_data_rows + new_scene_sample_data_rows)
+    save_json(metadata_root / "ego_pose.json", kept_target_ego_pose_rows + new_scene_ego_pose_rows)
+    save_json(
+        metadata_root / "calibrated_sensor.json",
+        kept_target_calibrated_sensor_rows + new_scene_calibrated_rows,
+    )
+
+    print(f"Backed up original JSON files to: {backup_dir}")
+    print(
+        f"Replaced {TARGET_SCENE_NAME} with {source_scene['name']} "
+        f"using {len(new_scene_sample_data_rows)} sample_data rows"
+    )
+    print(f"Added {len(new_scene_ego_pose_rows)} ego_pose rows")
+    print(f"Added {len(new_scene_calibrated_rows)} calibrated_sensor rows")
+    print("Done. Regenerate any downstream info/index files before running inference.")
+
+
+if __name__ == "__main__":
+    main()
